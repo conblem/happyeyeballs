@@ -1,12 +1,12 @@
 [package]
 name = "happyeyeballs"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["conblem <mail@conblem.me>"]
 edition = "2018"
 license = "MIT"
-description = "Simple Happy Eyeballs implementation not RFC compliant atm"
+description = "Simple Happy Eyeballs implementation in Tokio (not RFC compliant atm)"
 categories = ["asynchronous", "network-programming"]
-keywords = ["happy", "eyeballs", "rfc6555", "ipv4", "ipv6"]
+keywords = ["happy", "eyeballs", "rfc6555", "ipv6", "tokio"]
 repository = "https://github.com/conblem/happyeyeballs"
 
 [dependencies]
