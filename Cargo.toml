@@ -3,6 +3,11 @@ name = "happyeyeballs"
 version = "0.1.0"
 authors = ["conblem <mail@conblem.me>"]
 edition = "2018"
+license = "MIT"
+description = "Simple Happy Eyeballs implementation not RFC compliant atm"
+categories = ["asynchronous", "network-programming"]
+keywords = ["happy", "eyeballs", "rfc6555", "ipv4", "ipv6"]
+repository = "https://github.com/conblem/happyeyeballs"
 
 [dependencies]
 tokio = { version = "1", default-features = false, features = ["net", "time", "macros"] }

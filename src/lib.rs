@@ -126,7 +126,7 @@ mod tests {
         tokio::spawn(server(listener_four));
         tokio::spawn(server(listener_six));
 
-        // connecto to localhost using happyeyeballs
+        // connect to to localhost using happyeyeballs
         let mut stream = connect(format!("localhost:{}", port)).await?;
 
         // test if connection actually works, probably pretty useless
