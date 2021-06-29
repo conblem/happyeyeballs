@@ -4,14 +4,6 @@ use std::time::Duration;
 use tokio::io;
 use tokio::net::{lookup_host, TcpStream, ToSocketAddrs};
 
-trait Inner<I, O>: FnOnce(I) -> O {}
-
-impl<I, O, F> Inner<I, O> for F where F: FnOnce(I) -> O {}
-
-pub async fn connect<T: ToSocketAddrs>(addr: T) -> io::Result<TcpStream> {
-    connect_higher(addr, lookup_host).await
-}
-
 fn partition<T: Iterator<Item = SocketAddr>>(
     ips: T,
 ) -> (
@@ -34,6 +26,7 @@ fn partition<T: Iterator<Item = SocketAddr>>(
     (six, four)
 }
 
+// we use a higher order function to inject the dns resolver for future flexibility
 async fn connect_higher<I, F, T, L>(addr: T, lookup: L) -> io::Result<TcpStream>
 where
     I: Iterator<Item = SocketAddr>,
@@ -43,6 +36,7 @@ where
     let ips: I = lookup(addr).await?;
     let (mut six, mut four) = partition(ips);
 
+    // if dns lookup does not return both an ipv4 / ipv6 record skip happy eyeballs logic
     let (six, four) = match (six.next(), four.next()) {
         (None, Some(addr)) => {
             println!("only v4 address returned");
@@ -52,50 +46,41 @@ where
             println!("only v6 address returned");
             return TcpStream::connect(addr).await;
         }
+        // both adress types returned
         (Some(six), Some(four)) => (six, four),
         (None, None) => return Err(io::ErrorKind::NotFound.into()),
     };
 
-    let sleep = tokio::time::sleep(Duration::from_millis(250));
-    tokio::pin!(sleep);
-    let six_stream = TcpStream::connect(six);
-    tokio::pin!(six_stream);
+    let connect_six = TcpStream::connect(six);
+    // pin future on the stack so we repoll it after timeout while ipv4 is connecting
+    tokio::pin!(connect_six);
 
-    let mut error = None;
+    let timeout = tokio::time::timeout(Duration::from_millis(250), &mut connect_six);
 
-    loop {
-        tokio::select! {
-            biased;
-            stream = &mut six_stream => {
-                match stream {
-                    Ok(stream) => {
-                        println!("successfully connected to v6");
-                        return Ok(stream)
-                    }
-                    Err(e) => {
-                        error = Some(e);
-                        break;
-                    }
-                };
-            }
-            () = &mut sleep => {
-                println!("timeout connecting to v6");
-                break;
-            }
-        }
-    }
-
-    println!("i am here");
+    let err = match timeout.await {
+        Ok(Ok(stream)) => return Ok(stream),
+        // if ipv6 already returned an error safe it so we know not the poll the ipv6 future again
+        Ok(Err(e)) => Some(e),
+        Err(_elapsed) => None,
+    };
 
     tokio::select! {
-        Ok(stream) = &mut six_stream, if error.is_none() => {
-            return Ok(stream);
-        }
+        // biased select as we want to try connecting to ipv4 first
+        biased;
         stream = TcpStream::connect(four) => {
             println!("successfully connected to v4");
             return stream;
         }
+        // if ipv6 did not already return an error we still try to poll it
+        // in case it connects before ipv4 returns a connection
+        Ok(stream) = &mut connect_six, if err.is_none() => {
+            return Ok(stream);
+        }
     }
+}
+
+pub async fn connect<T: ToSocketAddrs>(addr: T) -> io::Result<TcpStream> {
+    connect_higher(addr, lookup_host).await
 }
 
 #[cfg(test)]
@@ -121,24 +106,30 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[tokio::test]
     async fn it_works() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
+        // check if ipv6 and ipv4 are both enabled on loopback interface
         let (mut six, mut four) = lookup_host("localhost:80").await.map(partition)?;
 
         if six.next().is_none() || four.next().is_none() {
-            Err("IPv6 and IPv4 not both enabled on loopback")?
+            Err("Both IPv6 and IPv4 need to be enabled on loopback interface")?
         }
 
+        // create an ipv4 listener on a random free port
         let listener_four = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener_four.local_addr()?.port();
 
+        // try to bind ipv6 listener on same random port
         let listener_six = TcpListener::bind(format!("[::1]:{}", port)).await?;
 
+        // spawn echo tcp servers
         tokio::spawn(server(listener_four));
         tokio::spawn(server(listener_six));
 
+        // connecto to localhost using happyeyeballs
         let mut stream = connect(format!("localhost:{}", port)).await?;
 
+        // test if connection actually works, probably pretty useless
         let expected = b"hallo";
         stream.write_all(expected).await?;
 
