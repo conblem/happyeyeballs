@@ -1,27 +1,14 @@
 use std::future::Future;
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io;
 use tokio::net::{lookup_host, TcpStream, ToSocketAddrs};
+use tracing::field;
+use tracing::{trace, trace_span, Instrument, Span};
 
-fn partition<T: Iterator<Item = SocketAddr>>(
-    ips: T,
-) -> (
-    impl Iterator<Item = SocketAddrV6>,
-    impl Iterator<Item = SocketAddrV4>,
-) {
+fn partition<T: Iterator<Item = SocketAddr>>(ips: T) -> (Vec<SocketAddr>, Vec<SocketAddr>) {
     let (six, four): (Vec<SocketAddr>, Vec<SocketAddr>) =
-        ips.partition(|addr| matches!(addr, SocketAddr::V6(_)));
-
-    let six = six.into_iter().filter_map(|addr| match addr {
-        SocketAddr::V6(six) => Some(six),
-        SocketAddr::V4(_) => None,
-    });
-
-    let four = four.into_iter().filter_map(|addr| match addr {
-        SocketAddr::V4(four) => Some(four),
-        SocketAddr::V6(_) => None,
-    });
+        ips.partition(|ip| matches!(ip, SocketAddr::V6(_)));
 
     (six, four)
 }
@@ -33,24 +20,27 @@ where
     F: Future<Output = io::Result<I>>,
     L: FnOnce(T) -> F,
 {
-    let ips: I = lookup(addr).await?;
-    let (mut six, mut four) = partition(ips);
+    let span = Span::current();
+    let (mut six, mut four) = lookup(addr).await.map(partition)?;
 
     // if dns lookup does not return both an ipv4 / ipv6 record skip happy eyeballs logic
-    let (six, four) = match (six.next(), four.next()) {
+    let (six, four) = match (six.pop(), four.pop()) {
         (None, Some(addr)) => {
-            println!("only v4 address returned");
+            span.record("ipv4", &field::display(&addr));
+            trace!("only ipv4");
             return TcpStream::connect(addr).await;
         }
         (Some(addr), None) => {
-            println!("only v6 address returned");
+            span.record("ipv6", &field::display(&addr));
+            trace!("only ipv6");
             return TcpStream::connect(addr).await;
         }
-        // both adress types returned
         (Some(six), Some(four)) => (six, four),
-        (None, None) => return Err(io::ErrorKind::NotFound.into()),
+        _ => return Err(io::ErrorKind::NotFound.into()),
     };
 
+    span.record("ipv6", &field::display(&six));
+    span.record("ipv4", &field::display(&four));
     let connect_six = TcpStream::connect(six);
     // pin future on the stack so we repoll it after timeout while ipv4 is connecting
     tokio::pin!(connect_six);
@@ -58,29 +48,41 @@ where
     let timeout = tokio::time::timeout(Duration::from_millis(250), &mut connect_six);
 
     let err = match timeout.await {
-        Ok(Ok(stream)) => return Ok(stream),
+        Ok(Ok(stream)) => {
+            trace!("ipv6");
+            return Ok(stream);
+        }
         // if ipv6 already returned an error safe it so we know not the poll the ipv6 future again
-        Ok(Err(e)) => Some(e),
-        Err(_elapsed) => None,
+        Ok(Err(e)) => {
+            trace!("ipv6 connection errored");
+            Some(e)
+        }
+        Err(_elapsed) => {
+            trace!("ipv6 connection timedout");
+            None
+        }
     };
 
     tokio::select! {
         // biased select as we want to try connecting to ipv4 first
         biased;
         stream = TcpStream::connect(four) => {
-            println!("successfully connected to v4");
+            trace!("ipv4");
             return stream;
         }
         // if ipv6 did not already return an error we still try to poll it
         // in case it connects before ipv4 returns a connection
         Ok(stream) = &mut connect_six, if err.is_none() => {
+            trace!("ipv6 connected after ipv4");
             return Ok(stream);
         }
     }
 }
 
 pub async fn connect<T: ToSocketAddrs>(addr: T) -> io::Result<TcpStream> {
-    connect_higher(addr, lookup_host).await
+    let span = trace_span!("happyeyeballs", ipv4 = field::Empty, ipv6 = field::Empty);
+
+    connect_higher(addr, lookup_host).instrument(span).await
 }
 
 #[cfg(test)]
@@ -88,6 +90,7 @@ mod tests {
     use std::error::Error;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tracing_test::traced_test;
 
     use super::*;
 
@@ -107,11 +110,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn it_works() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         // check if ipv6 and ipv4 are both enabled on loopback interface
-        let (mut six, mut four) = lookup_host("localhost:80").await.map(partition)?;
+        let (six, four) = lookup_host("localhost:80").await.map(partition)?;
 
-        if six.next().is_none() || four.next().is_none() {
+        if six.is_empty() || four.is_empty() {
             Err("Both IPv6 and IPv4 need to be enabled on loopback interface")?
         }
 
@@ -134,7 +138,7 @@ mod tests {
         stream.write_all(expected).await?;
 
         let mut buf = vec![0; expected.len()].into_boxed_slice();
-        let n = stream.read_exact(&mut buf[..expected.len()]).await?;
+        let n = stream.read_exact(&mut buf[..]).await?;
 
         assert_eq!(expected.len(), n);
         assert_eq!(expected, &buf[..n]);
